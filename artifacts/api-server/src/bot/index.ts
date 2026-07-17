@@ -3,6 +3,7 @@ import { eq, and, sql, desc } from "drizzle-orm";
 import {
   db, productsTable, ordersTable, botUsersTable,
   inventoryItemsTable, settingsTable, walletTransactionsTable,
+  pendingDepositsTable,
 } from "@workspace/db";
 import { logger } from "../lib/logger.js";
 import {
@@ -161,6 +162,189 @@ function buildTopupMenu() {
 }
 
 /**
+ * Cộng ví cho user sau khi deposit xác nhận — dùng chung cho poll tự động và admin credit.
+ * Trả về balanceAfter, hoặc ném lỗi.
+ */
+async function creditDeposit(userId: number, amount: number, transferContent: string): Promise<number> {
+  const user = await getUser(userId);
+  if (!user) throw new Error(`Không tìm thấy user ${userId}`);
+  const balanceBefore = user.balance;
+  const balanceAfter = balanceBefore + amount;
+  await db.update(botUsersTable).set({ balance: balanceAfter }).where(eq(botUsersTable.telegramId, userId));
+  await db.insert(walletTransactionsTable).values({
+    telegramUserId: userId,
+    type: "deposit",
+    amount,
+    balanceBefore,
+    balanceAfter,
+    note: `Nạp qua gcmmo — ${transferContent}`,
+  });
+  return balanceAfter;
+}
+
+/**
+ * Core poll loop — dùng lại cho cả tạo mới lẫn resume sau restart.
+ */
+function startPollLoop(
+  b: Bot,
+  userId: number,
+  chatId: number,
+  deposit: GcmmoDeposit,
+  expiresAt: Date,
+) {
+  const POLL_INTERVAL = 12_000;
+
+  // Huỷ phiên cũ trong RAM nếu đang có
+  const existing = activeDeposits.get(userId);
+  if (existing) {
+    clearTimeout(existing.timeoutHandle);
+    activeDeposits.delete(userId);
+  }
+
+  const msUntilExpiry = Math.max(expiresAt.getTime() - Date.now(), 0);
+
+  const timeoutHandle = setTimeout(async () => {
+    activeDeposits.delete(userId);
+    // Đánh dấu expired trong DB
+    await db.update(pendingDepositsTable)
+      .set({ status: "expired", resolvedAt: new Date() })
+      .where(eq(pendingDepositsTable.gcmmoDepositId, deposit.id))
+      .catch(() => {});
+    b.api.sendMessage(chatId,
+      `⏰ <b>Phiên nạp tiền đã hết hạn</b>\n\n📝 Mã: <code>${deposit.transfer_content}</code>\n💵 Số tiền: ${formatVnd(deposit.amount)}\n\nNếu bạn đã chuyển tiền, dùng lệnh /kiemtra_nap để admin xác nhận.`,
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💰 Tạo phiên mới", "main:topup") }
+    ).catch(() => {});
+  }, msUntilExpiry);
+
+  activeDeposits.set(userId, { depositId: deposit.id, amount: deposit.amount, chatId, timeoutHandle });
+
+  const pollDeposit = async () => {
+    const active = activeDeposits.get(userId);
+    if (!active || active.depositId !== deposit.id) return; // bị huỷ hoặc thay thế
+
+    try {
+      const latest = await getGcmmoDeposit(deposit.id);
+
+      if (latest.status === "completed") {
+        clearTimeout(active.timeoutHandle);
+        activeDeposits.delete(userId);
+
+        // Cộng ví
+        const balanceAfter = await creditDeposit(userId, deposit.amount, deposit.transfer_content);
+
+        // Đánh dấu completed trong DB
+        await db.update(pendingDepositsTable)
+          .set({ status: "completed", resolvedAt: new Date() })
+          .where(eq(pendingDepositsTable.gcmmoDepositId, deposit.id))
+          .catch(() => {});
+
+        await b.api.sendMessage(chatId,
+          `🎉 <b>Nạp tiền thành công!</b>\n\n` +
+          `⬆️ Đã nhận: <b>${formatVnd(deposit.amount)}</b>\n` +
+          `💳 Số dư mới: <b>${formatVnd(balanceAfter)}</b>\n\n` +
+          `🛍️ Bạn có thể mua hàng ngay!`,
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🛍️ Mua hàng ngay", "main:shop").row().text("🏠 Menu chính", "main:back") }
+        );
+        return;
+      }
+
+      if (latest.status === "expired" || latest.status === "cancelled") {
+        clearTimeout(active.timeoutHandle);
+        activeDeposits.delete(userId);
+        await db.update(pendingDepositsTable)
+          .set({ status: latest.status, resolvedAt: new Date() })
+          .where(eq(pendingDepositsTable.gcmmoDepositId, deposit.id))
+          .catch(() => {});
+        return;
+      }
+
+      // Vẫn pending → poll tiếp
+      setTimeout(pollDeposit, POLL_INTERVAL);
+    } catch {
+      // Lỗi mạng tạm thời → poll tiếp
+      setTimeout(pollDeposit, POLL_INTERVAL * 2);
+    }
+  };
+
+  // Bắt đầu poll sau 10 giây
+  setTimeout(pollDeposit, 10_000);
+}
+
+/**
+ * Resume tất cả deposit đang polling từ DB sau khi server restart.
+ * Gọi 1 lần khi bot khởi động.
+ */
+async function resumePendingDeposits(b: Bot) {
+  const rows = await db.query.pendingDepositsTable.findMany({
+    where: eq(pendingDepositsTable.status, "polling"),
+  });
+  if (rows.length === 0) return;
+  logger.info({ count: rows.length }, "Resuming pending deposits after restart");
+
+  for (const row of rows) {
+    const now = Date.now();
+    if (row.expiresAt.getTime() <= now) {
+      // Đã hết hạn trong lúc server off
+      await db.update(pendingDepositsTable)
+        .set({ status: "expired", resolvedAt: new Date() })
+        .where(eq(pendingDepositsTable.id, row.id));
+      // Thông báo cho user
+      b.api.sendMessage(Number(row.chatId),
+        `⏰ <b>Phiên nạp tiền đã hết hạn trong lúc hệ thống bảo trì</b>\n\n📝 Mã: <code>${row.transferContent}</code>\n💵 Số tiền: ${formatVnd(row.amount)}\n\nNếu đã chuyển tiền, liên hệ admin (gõ /kiemtra_nap) để được hỗ trợ.`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+      continue;
+    }
+
+    // Kiểm tra ngay trên gcmmo — có thể đã completed trong lúc server off
+    try {
+      const latest = await getGcmmoDeposit(row.gcmmoDepositId);
+      if (latest.status === "completed") {
+        // Kiểm tra chưa cộng tiền (tránh double credit)
+        const alreadyCredited = await db.query.walletTransactionsTable.findFirst({
+          where: (t, { and, eq: eqOp, like }) =>
+            and(eqOp(t.telegramUserId, Number(row.telegramUserId)), like(t.note ?? "", `%${row.transferContent}%`)),
+        });
+        if (!alreadyCredited) {
+          const balanceAfter = await creditDeposit(Number(row.telegramUserId), row.amount, row.transferContent);
+          b.api.sendMessage(Number(row.chatId),
+            `🎉 <b>Nạp tiền đã được xác nhận!</b> (hệ thống vừa khởi động lại)\n\n⬆️ Đã nhận: <b>${formatVnd(row.amount)}</b>\n💳 Số dư mới: <b>${formatVnd(balanceAfter)}</b>`,
+            { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🛍️ Mua hàng ngay", "main:shop") }
+          ).catch(() => {});
+        }
+        await db.update(pendingDepositsTable)
+          .set({ status: "completed", resolvedAt: new Date() })
+          .where(eq(pendingDepositsTable.id, row.id));
+        continue;
+      }
+      if (latest.status === "expired" || latest.status === "cancelled") {
+        await db.update(pendingDepositsTable)
+          .set({ status: latest.status, resolvedAt: new Date() })
+          .where(eq(pendingDepositsTable.id, row.id));
+        continue;
+      }
+    } catch {
+      // gcmmo API lỗi → resume poll bình thường
+    }
+
+    // Vẫn pending → resume poll loop (chỉ cần id, amount, status, transfer_content, expires_at)
+    const fakeDeposit: GcmmoDeposit = {
+      id: row.gcmmoDepositId,
+      amount: row.amount,
+      status: "pending",
+      transfer_content: row.transferContent,
+      expires_at: row.expiresAt.toISOString(),
+      // Các trường chỉ cần khi hiển thị, không cần cho poll loop
+      user_id: "", currency: "VND", payment_code: row.transferContent,
+      provider: "", receive_bank_bin: "", receive_account_number: "",
+      receive_account_name: "", qr_code_url: "",
+      created_at: row.createdAt.toISOString(), updated_at: row.createdAt.toISOString(),
+    };
+    startPollLoop(b, Number(row.telegramUserId), Number(row.chatId), fakeDeposit, row.expiresAt);
+  }
+}
+
+/**
  * Tạo phiên nạp tiền gcmmo và gửi QR/bank info cho user.
  * editFn: hàm để edit tin nhắn gốc (inline callback) hoặc send tin mới
  */
@@ -189,8 +373,20 @@ async function doCreateDeposit(
     return;
   }
 
+  // Lưu vào DB để resume sau restart
+  await db.insert(pendingDepositsTable).values({
+    telegramUserId: userId,
+    chatId,
+    gcmmoDepositId: deposit.id,
+    amount: deposit.amount,
+    transferContent: deposit.transfer_content,
+    status: "polling",
+    expiresAt: new Date(deposit.expires_at),
+  }).onConflictDoNothing();
+
   const bankName = bankBinToName(deposit.receive_bank_bin);
-  const expiresIn = Math.round((new Date(deposit.expires_at).getTime() - Date.now()) / 60_000);
+  const expiresAt = new Date(deposit.expires_at);
+  const expiresIn = Math.round((expiresAt.getTime() - Date.now()) / 60_000);
 
   const infoText =
     `💰 <b>Phiên nạp tiền</b>\n\n` +
@@ -214,91 +410,16 @@ async function doCreateDeposit(
       parse_mode: "HTML",
       reply_markup: kb,
     });
-    // Edit tin nhắn gốc thành thông báo đã gửi QR
     await editFn(
       `📸 <b>Đã gửi mã QR bên dưới!</b>\n\n💵 Số tiền: <b>${formatVnd(deposit.amount)}</b>\n📝 Nội dung: <code>${deposit.transfer_content}</code>\n\n⏳ Đang theo dõi xác nhận tự động...`,
       new InlineKeyboard().text("🔄 Nạp lần nữa", "main:topup").row().text("🔙 Menu", "main:back")
     );
   } catch {
-    // Nếu gửi ảnh lỗi → hiện text thôi
     await editFn(infoText, kb);
   }
 
-  // Huỷ phiên cũ nếu đang có
-  const existing = activeDeposits.get(userId);
-  if (existing) {
-    clearTimeout(existing.timeoutHandle);
-    activeDeposits.delete(userId);
-  }
-
-  // Bắt đầu poll ngầm
-  const POLL_INTERVAL = 12_000;  // 12 giây
-  const TIMEOUT_MS = Math.max(expiresIn * 60_000, 15 * 60_000); // ít nhất 15 phút
-
-  const timeoutHandle = setTimeout(() => {
-    activeDeposits.delete(userId);
-    // Thông báo hết hạn
-    b.api.sendMessage(chatId,
-      `⏰ <b>Phiên nạp tiền đã hết hạn</b>\n\n📝 Mã: <code>${deposit.transfer_content}</code>\n💵 Số tiền: ${formatVnd(deposit.amount)}\n\nNếu bạn đã chuyển, liên hệ admin để được hỗ trợ.`,
-      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("💰 Tạo phiên mới", "main:topup") }
-    ).catch(() => {});
-  }, TIMEOUT_MS);
-
-  activeDeposits.set(userId, { depositId: deposit.id, amount: deposit.amount, chatId, timeoutHandle });
-
-  // Poll loop
-  const pollDeposit = async () => {
-    const active = activeDeposits.get(userId);
-    if (!active || active.depositId !== deposit.id) return; // bị huỷ hoặc thay thế
-
-    try {
-      const latest = await getGcmmoDeposit(deposit.id);
-
-      if (latest.status === "completed") {
-        clearTimeout(active.timeoutHandle);
-        activeDeposits.delete(userId);
-
-        // Cộng ví cho user
-        const user = await getUser(userId);
-        if (!user) return;
-        const balanceBefore = user.balance;
-        const balanceAfter = balanceBefore + deposit.amount;
-        await db.update(botUsersTable).set({ balance: balanceAfter }).where(eq(botUsersTable.telegramId, userId));
-        await db.insert(walletTransactionsTable).values({
-          telegramUserId: userId,
-          type: "deposit",
-          amount: deposit.amount,
-          balanceBefore,
-          balanceAfter,
-          note: `Nạp qua gcmmo — ${deposit.transfer_content}`,
-        });
-
-        await b.api.sendMessage(chatId,
-          `🎉 <b>Nạp tiền thành công!</b>\n\n` +
-          `⬆️ Đã nhận: <b>${formatVnd(deposit.amount)}</b>\n` +
-          `💳 Số dư mới: <b>${formatVnd(balanceAfter)}</b>\n\n` +
-          `🛍️ Bạn có thể mua hàng ngay!`,
-          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🛍️ Mua hàng ngay", "main:shop").row().text("🏠 Menu chính", "main:back") }
-        );
-        return;
-      }
-
-      if (latest.status === "expired" || latest.status === "cancelled") {
-        clearTimeout(active.timeoutHandle);
-        activeDeposits.delete(userId);
-        return;
-      }
-
-      // Vẫn pending → poll tiếp
-      setTimeout(pollDeposit, POLL_INTERVAL);
-    } catch {
-      // Lỗi mạng tạm thời → poll tiếp
-      setTimeout(pollDeposit, POLL_INTERVAL * 2);
-    }
-  };
-
-  // Bắt đầu poll sau 15 giây (chờ user chuyển khoản)
-  setTimeout(pollDeposit, 15_000);
+  // Bắt đầu poll loop (lưu trạng thái trong RAM + DB)
+  startPollLoop(b, userId, chatId, deposit, expiresAt);
 }
 
 // ─── Menu chính ──────────────────────────────────────────────────────────────
@@ -1001,6 +1122,101 @@ export function setupBot(b: Bot) {
     }
   });
 
+  // /kiemtra_nap <gcmmo_deposit_id> — Admin kiểm tra & credit deposit thủ công
+  b.command("kiemtra_nap", async (ctx) => {
+    if (!ctx.from) return;
+    if (!isAdmin(ctx.from.id)) { await ctx.reply("⛔ Bạn không có quyền dùng lệnh này."); return; }
+    const depositId = (ctx.message?.text ?? "").split(" ")[1]?.trim();
+    if (!depositId) {
+      await ctx.reply(
+        "❌ Cú pháp: /kiemtra_nap &lt;gcmmo_deposit_id&gt;\n\n" +
+        "Deposit ID là mã phiên nạp trên gcmmo (VD: dep_abc123).\n" +
+        "Dùng /ds_nap để xem danh sách deposit đang chờ.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    await ctx.reply(`⏳ Đang kiểm tra deposit <code>${depositId}</code> trên gcmmo...`, { parse_mode: "HTML" });
+
+    // Lấy deposit từ DB
+    const row = await db.query.pendingDepositsTable.findFirst({
+      where: eq(pendingDepositsTable.gcmmoDepositId, depositId),
+    });
+
+    if (!row) {
+      await ctx.reply("❌ Không tìm thấy deposit này trong DB.\nDeposit phải được tạo từ bot trước.");
+      return;
+    }
+
+    // Kiểm tra đã credited chưa
+    const alreadyCredited = await db.query.walletTransactionsTable.findFirst({
+      where: (t, { and, eq: eqOp, like }) =>
+        and(eqOp(t.telegramUserId, Number(row.telegramUserId)), like(t.note ?? "", `%${row.transferContent}%`)),
+    });
+    if (alreadyCredited) {
+      await ctx.reply(`✅ Deposit này đã được cộng ví rồi (tx #${alreadyCredited.id}).`);
+      return;
+    }
+
+    // Kiểm tra trên gcmmo
+    let gcmmoStatus = "unknown";
+    try {
+      const latest = await getGcmmoDeposit(depositId);
+      gcmmoStatus = latest.status;
+    } catch (err) {
+      await ctx.reply(`❌ Không thể lấy thông tin từ gcmmo: ${(err as Error).message.slice(0, 150)}`);
+      return;
+    }
+
+    if (gcmmoStatus === "completed") {
+      const balanceAfter = await creditDeposit(Number(row.telegramUserId), row.amount, row.transferContent);
+      await db.update(pendingDepositsTable)
+        .set({ status: "completed", resolvedAt: new Date() })
+        .where(eq(pendingDepositsTable.gcmmoDepositId, depositId));
+
+      await ctx.reply(
+        `✅ <b>Đã cộng ví thành công!</b>\n\n` +
+        `👤 User ID: <code>${row.telegramUserId}</code>\n` +
+        `⬆️ Số tiền: <b>${formatVnd(row.amount)}</b>\n` +
+        `💳 Số dư mới: <b>${formatVnd(balanceAfter)}</b>`,
+        { parse_mode: "HTML" }
+      );
+      // Thông báo cho user
+      b.api.sendMessage(Number(row.chatId),
+        `🎉 <b>Nạp tiền đã được xác nhận bởi admin!</b>\n\n⬆️ Đã nhận: <b>${formatVnd(row.amount)}</b>\n💳 Số dư mới: <b>${formatVnd(balanceAfter)}</b>`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+    } else {
+      await ctx.reply(
+        `ℹ️ Trạng thái deposit trên gcmmo: <b>${gcmmoStatus}</b>\n\n` +
+        `💵 Số tiền: ${formatVnd(row.amount)}\n` +
+        `📝 Mã CK: <code>${row.transferContent}</code>\n\n` +
+        (gcmmoStatus === "pending"
+          ? "⏳ Chưa nhận được tiền. Nếu user đã chuyển, hãy chờ gcmmo xác nhận hoặc dùng /napvi để nạp thủ công."
+          : `⚠️ Trạng thái không hợp lệ để credit. Dùng /napvi nếu cần nạp thủ công.`),
+        { parse_mode: "HTML" }
+      );
+    }
+  });
+
+  // /ds_nap — Danh sách deposit đang chờ (admin)
+  b.command("ds_nap", async (ctx) => {
+    if (!ctx.from) return;
+    if (!isAdmin(ctx.from.id)) { await ctx.reply("⛔ Bạn không có quyền dùng lệnh này."); return; }
+    const rows = await db.query.pendingDepositsTable.findMany({
+      where: eq(pendingDepositsTable.status, "polling"),
+    });
+    if (rows.length === 0) { await ctx.reply("✅ Không có deposit nào đang chờ."); return; }
+    const lines = rows.map(r =>
+      `• <code>${r.gcmmoDepositId}</code> — ${formatVnd(r.amount)} — UID <code>${r.telegramUserId}</code> — hết hạn ${r.expiresAt.toLocaleString("vi-VN")}`
+    );
+    await ctx.reply(
+      `📋 <b>Deposit đang chờ xác nhận (${rows.length}):</b>\n\n${lines.join("\n")}\n\n` +
+      `Dùng /kiemtra_nap &lt;id&gt; để xác nhận thủ công.`,
+      { parse_mode: "HTML" }
+    );
+  });
+
   // /sodu_user <telegram_id> — Xem số dư của user
   b.command("sodu_user", async (ctx) => {
     if (!ctx.from) return;
@@ -1077,7 +1293,7 @@ export function setupBot(b: Bot) {
     ctx.reply(
       "🤖 <b>GC MMO Shop</b>\n\n" +
       "/start — Menu chính\n/sodu — Số dư ví\n/orders — Lịch sử mua hàng\n\n" +
-      "<b>Admin:</b>\n/napvi &lt;id&gt; &lt;số_tiền&gt; [ghi_chú] — Nạp tiền cho user\n/sodu_user &lt;id&gt; — Xem số dư user\n/connect — Kết nối gcmmo\n/dongbo /thongke /gcmmo_status",
+      "<b>Admin:</b>\n/napvi &lt;id&gt; &lt;số_tiền&gt; [ghi_chú] — Nạp tiền thủ công\n/sodu_user &lt;id&gt; — Xem số dư user\n/kiemtra_nap &lt;deposit_id&gt; — Kiểm tra &amp; credit deposit\n/ds_nap — Danh sách deposit đang chờ\n/connect — Kết nối gcmmo\n/dongbo /thongke /gcmmo_status",
       { parse_mode: "HTML" }
     )
   );
@@ -1162,4 +1378,7 @@ export function setupBot(b: Bot) {
   });
 
   b.catch((err) => logger.error({ err }, "Bot error"));
+
+  // Resume poll cho các deposit đang chờ từ trước khi restart
+  resumePendingDeposits(b).catch((err) => logger.error({ err }, "resumePendingDeposits failed"));
 }
