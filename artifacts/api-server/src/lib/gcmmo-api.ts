@@ -512,47 +512,87 @@ export interface GcmmoBuyerOrder {
 
 /**
  * Mua sản phẩm từ gcmmo marketplace (vai trò buyer).
- * Bot dùng để tự động mua khi có người đặt hàng.
+ * Thứ tự thử endpoint (đã xác nhận tồn tại qua probe):
+ *   1. POST /v1/orders/create   ← endpoint chính thức
+ *   2. POST /v1/checkout        ← fallback #1
+ *   3. POST /v1/cart/checkout   ← fallback #2 (thêm vào cart rồi checkout)
+ *   4. POST /v1/orders          ← fallback cuối (chỉ có GET route, POST thường 404)
+ *
+ * Body thử lần lượt:
+ *   - Flat: { product_id, variant_id, quantity }
+ *   - Array: { items: [{ product_id, variant_id, quantity }] }
  */
 export async function buyGcmmoProduct(params: {
   productId: string;
   variantId?: string;
   quantity?: number;
 }): Promise<GcmmoBuyerOrder> {
-  const body: Record<string, unknown> = {
-    product_id: params.productId,
-    quantity: params.quantity ?? 1,
-  };
-  if (params.variantId) body["variant_id"] = params.variantId;
+  const qty = params.quantity ?? 1;
 
-  // Try primary endpoint, fall back to alternate
-  try {
-    return await gcmmoFetch<GcmmoBuyerOrder>("/v1/orders", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-  } catch (err) {
-    // Some gcmmo instances use /v1/buyer/orders
-    const msg = (err as Error).message;
-    if (msg.includes("404") || msg.includes("405")) {
-      return gcmmoFetch<GcmmoBuyerOrder>("/v1/buyer/orders", {
+  // Body formats để thử
+  const flatBody: Record<string, unknown> = { product_id: params.productId, quantity: qty };
+  if (params.variantId) flatBody["variant_id"] = params.variantId;
+
+  const arrayBody: Record<string, unknown> = {
+    items: [{ product_id: params.productId, ...(params.variantId ? { variant_id: params.variantId } : {}), quantity: qty }],
+  };
+
+  // Endpoint priority (confirmed via probe: orders/create, checkout, cart/checkout exist; buyer/orders does NOT)
+  const endpoints: Array<{ path: string; body: Record<string, unknown> }> = [
+    { path: "/v1/orders/create", body: flatBody },
+    { path: "/v1/orders/create", body: arrayBody },
+    { path: "/v1/checkout",      body: flatBody },
+    { path: "/v1/checkout",      body: arrayBody },
+    { path: "/v1/cart/checkout", body: flatBody },
+    { path: "/v1/orders",        body: flatBody },
+  ];
+
+  let lastErr: Error = new Error("Không thể đặt hàng từ gcmmo — tất cả endpoint đều thất bại");
+
+  for (const { path, body } of endpoints) {
+    try {
+      const result = await gcmmoFetch<GcmmoBuyerOrder>(path, {
         method: "POST",
         body: JSON.stringify(body),
       });
+      return result;
+    } catch (err) {
+      const msg = (err as Error).message;
+      lastErr = err as Error;
+      // Chỉ thử tiếp nếu là 404/405 (route không tồn tại hoặc method sai)
+      if (msg.includes("404") || msg.includes("405") || msg.includes("Method Not Allowed")) continue;
+      // Lỗi khác (401, 422, 500...) → dừng ngay, không thử endpoint khác
+      throw err;
     }
-    throw err;
   }
+
+  throw lastErr;
 }
 
 /**
- * Lấy chi tiết đơn hàng đã mua từ gcmmo (để kiểm tra nội dung đã giao).
+ * Lấy chi tiết đơn hàng đã mua từ gcmmo.
+ * /v1/orders/{id} là endpoint chính (GET /v1/orders tồn tại, xác nhận qua probe).
+ * /v1/buyer/orders/{id} KHÔNG tồn tại — đã loại bỏ.
  */
 export async function getGcmmoBuyerOrder(orderId: string): Promise<GcmmoBuyerOrder> {
-  try {
-    return await gcmmoFetch<GcmmoBuyerOrder>(`/v1/orders/${orderId}`);
-  } catch {
-    return gcmmoFetch<GcmmoBuyerOrder>(`/v1/buyer/orders/${orderId}`);
+  // Thử các endpoint theo thứ tự ưu tiên
+  const paths = [
+    `/v1/orders/${orderId}`,
+    `/v1/orders/create/${orderId}`,
+    `/v1/checkout/${orderId}`,
+  ];
+  let lastErr: Error = new Error(`Không tìm thấy đơn hàng gcmmo: ${orderId}`);
+  for (const path of paths) {
+    try {
+      return await gcmmoFetch<GcmmoBuyerOrder>(path);
+    } catch (err) {
+      const msg = (err as Error).message;
+      lastErr = err as Error;
+      if (msg.includes("404")) continue;
+      throw err;
+    }
   }
+  throw lastErr;
 }
 
 /**
