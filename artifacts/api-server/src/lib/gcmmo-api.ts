@@ -549,10 +549,14 @@ export async function buyGcmmoProduct(params: {
 
   let lastErr: Error = new Error("Không thể đặt hàng từ gcmmo — tất cả endpoint đều thất bại");
 
+  // Idempotency key — unique per purchase attempt, prevents duplicate orders
+  const idempotencyKey = `bot-buy-${params.productId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
   for (const { path, body } of endpoints) {
     try {
       const result = await gcmmoFetch<GcmmoBuyerOrder>(path, {
         method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
         body: JSON.stringify(body),
       });
       return result;
