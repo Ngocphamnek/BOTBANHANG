@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import {
   Bot, Send, Eye, EyeOff, CheckCircle2, XCircle, Loader2,
-  RefreshCw, Link2, Zap, Wallet, Headphones,
+  RefreshCw, Link2, Zap, Wallet, Headphones, ShieldCheck,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -55,6 +55,12 @@ export function SettingsPage() {
   const [supportNote, setSupportNote] = useState("");
   const [savingSupport, setSavingSupport] = useState(false);
 
+  // Quality filter settings
+  const [minSellerReviews, setMinSellerReviews] = useState("");
+  const [minSellerRating, setMinSellerRating] = useState("");
+  const [minSellerSold, setMinSellerSold] = useState("");
+  const [savingQuality, setSavingQuality] = useState(false);
+
   async function fetchData() {
     setLoading(true);
     try {
@@ -76,6 +82,9 @@ export function SettingsPage() {
       setMinTopup(s.min_topup ?? "10000");
       setSupportContact(s.support_contact ?? "");
       setSupportNote(s.support_note ?? "");
+      setMinSellerReviews(s.min_seller_reviews ?? "0");
+      setMinSellerRating(s.min_seller_rating ?? "0");
+      setMinSellerSold(s.min_seller_sold ?? "0");
     } catch {
       toast({ title: "Lỗi tải settings", variant: "destructive" });
     } finally {
@@ -192,6 +201,22 @@ export function SettingsPage() {
       toast({ title: (e as Error).message, variant: "destructive" });
     } finally {
       setSavingSupport(false);
+    }
+  }
+
+  async function handleSaveQuality() {
+    setSavingQuality(true);
+    try {
+      await Promise.all([
+        saveSetting("min_seller_reviews", minSellerReviews.trim() || "0"),
+        saveSetting("min_seller_rating", minSellerRating.trim() || "0"),
+        saveSetting("min_seller_sold", minSellerSold.trim() || "0"),
+      ]);
+      toast({ title: "✅ Đã lưu bộ lọc chất lượng shop" });
+    } catch (e) {
+      toast({ title: (e as Error).message, variant: "destructive" });
+    } finally {
+      setSavingQuality(false);
     }
   }
 
@@ -463,6 +488,71 @@ export function SettingsPage() {
               {savingChannel ? <Loader2 className="h-4 w-4 animate-spin" /> : "Lưu"}
             </Button>
           </div>
+        </div>
+      </div>
+
+      {/* ── Lọc chất lượng shop ─────────────────────────────────────────────── */}
+      <div className="rounded-xl border bg-card p-6 space-y-4">
+        <h2 className="font-semibold flex items-center gap-2">
+          <ShieldCheck className="h-4 w-4 text-primary" />
+          Lọc chất lượng shop (Bot Telegram)
+        </h2>
+        <p className="text-xs text-muted-foreground">
+          Sản phẩm của shop <strong>không đạt</strong> ngưỡng bên dưới sẽ <strong>bị ẩn</strong> trên bot Telegram.
+          Đặt 0 để tắt điều kiện đó. Áp dụng ngay, không cần khởi động lại.
+        </p>
+        <div className="grid grid-cols-3 gap-4">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Lượt đánh giá tối thiểu</Label>
+            <Input
+              type="number"
+              min={0}
+              value={minSellerReviews}
+              onChange={(e) => setMinSellerReviews(e.target.value)}
+              placeholder="0 = không lọc"
+              className="bg-background"
+            />
+            <p className="text-xs text-muted-foreground">Shop dưới X lượt review → ẩn</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Rating tối thiểu (0–50)</Label>
+            <Input
+              type="number"
+              min={0}
+              max={50}
+              value={minSellerRating}
+              onChange={(e) => setMinSellerRating(e.target.value)}
+              placeholder="0 = không lọc"
+              className="bg-background"
+            />
+            <p className="text-xs text-muted-foreground">Nhập rating×10: 4.0 sao → 40</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Đơn hoàn thành tối thiểu</Label>
+            <Input
+              type="number"
+              min={0}
+              value={minSellerSold}
+              onChange={(e) => setMinSellerSold(e.target.value)}
+              placeholder="0 = không lọc"
+              className="bg-background"
+            />
+            <p className="text-xs text-muted-foreground">Shop bán dưới X đơn → ẩn</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 pt-1">
+          <Button onClick={handleSaveQuality} disabled={savingQuality} variant="outline">
+            {savingQuality ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            Lưu bộ lọc
+          </Button>
+          {(Number(minSellerReviews) > 0 || Number(minSellerRating) > 0 || Number(minSellerSold) > 0) && (
+            <span className="text-xs text-amber-400 flex items-center gap-1">
+              <ShieldCheck className="h-3.5 w-3.5" />
+              Đang lọc: shop cần ≥{minSellerReviews} đánh giá
+              {Number(minSellerRating) > 0 && `, ≥${(Number(minSellerRating)/10).toFixed(1)}⭐`}
+              {Number(minSellerSold) > 0 && `, ≥${minSellerSold} đơn`}
+            </span>
+          )}
         </div>
       </div>
     </div>

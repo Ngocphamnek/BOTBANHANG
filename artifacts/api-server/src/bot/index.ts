@@ -313,8 +313,55 @@ function buildMainMenu() {
 const CAT_KEY_MAP = new Map<string, string>(); // full cat name → short key "c0", "c1", ...
 const CAT_IDX_MAP = new Map<string, string>(); // short key → full cat name
 
+/**
+ * Đọc ngưỡng lọc chất lượng shop từ settings.
+ * - min_seller_reviews: số lượt đánh giá tối thiểu (default 0 = không lọc)
+ * - min_seller_rating:  rating tối thiểu x10 (default 0 = không lọc)
+ * - min_seller_sold:    đơn hoàn thành tối thiểu (default 0 = không lọc)
+ */
+async function getSellerQualityFilter(): Promise<{
+  minReviews: number; minRating: number; minSold: number;
+}> {
+  const [r, ra, s] = await Promise.all([
+    getSetting("min_seller_reviews", "0"),
+    getSetting("min_seller_rating", "0"),
+    getSetting("min_seller_sold", "0"),
+  ]);
+  return {
+    minReviews: parseInt(r) || 0,
+    minRating: parseInt(ra) || 0,   // stored as rating*10 (e.g. 40 = 4.0 sao)
+    minSold: parseInt(s) || 0,
+  };
+}
+
+/**
+ * Lọc danh sách sản phẩm theo chất lượng shop.
+ * Nếu sản phẩm chưa có dữ liệu shop (sellerReviewCount = null)
+ * nhưng ngưỡng = 0 → vẫn hiện (không phạt hàng cũ chưa cập nhật).
+ */
+function applySellerQualityFilter(
+  products: Array<typeof productsTable.$inferSelect>,
+  filter: { minReviews: number; minRating: number; minSold: number }
+): Array<typeof productsTable.$inferSelect> {
+  const { minReviews, minRating, minSold } = filter;
+  if (!minReviews && !minRating && !minSold) return products; // tắt lọc
+  return products.filter((p) => {
+    // Sản phẩm không phải từ gcmmo → luôn hiện (hàng thủ công)
+    if (!p.sourceId) return true;
+    const reviews = p.sellerReviewCount ?? 0;
+    const rating = p.sellerRating ?? 0;   // *10
+    const sold = p.sellerSoldCount ?? 0;
+    if (minReviews > 0 && reviews < minReviews) return false;
+    if (minRating > 0 && rating < minRating) return false;
+    if (minSold > 0 && sold < minSold) return false;
+    return true;
+  });
+}
+
 async function buildCategoryMenu(): Promise<InlineKeyboard | null> {
-  const products = await db.select().from(productsTable).where(eq(productsTable.isActive, true));
+  const filter = await getSellerQualityFilter();
+  const allProducts = await db.select().from(productsTable).where(eq(productsTable.isActive, true));
+  const products = applySellerQualityFilter(allProducts, filter);
   if (products.length === 0) return null;
 
   const catCount: Record<string, number> = {};
@@ -603,7 +650,11 @@ export function setupBot(b: Bot) {
     // Resolve key → tên danh mục đầy đủ
     const catName = catKey === "all" ? null : (CAT_IDX_MAP.get(catKey) ?? catKey);
 
-    const products = await db.select().from(productsTable).where(eq(productsTable.isActive, true));
+    const [allProducts, filter] = await Promise.all([
+      db.select().from(productsTable).where(eq(productsTable.isActive, true)),
+      getSellerQualityFilter(),
+    ]);
+    const products = applySellerQualityFilter(allProducts, filter);
     // Nếu key không tìm thấy trong map (server restart) → rebuild
     if (catKey !== "all" && !catName) {
       // Rebuild map bằng cách gọi buildCategoryMenu một lần

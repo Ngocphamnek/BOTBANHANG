@@ -12,6 +12,13 @@ export const productsTable = pgTable("products", {
   sourceId: text("source_id"),         // gcmmo.net product id
   gcmmoVariantId: text("gcmmo_variant_id"), // gcmmo variant id (dùng khi mua)
   gcmmoSellerId: text("gcmmo_seller_id"),   // seller id trên gcmmo (dùng khi mua)
+  gcmmoSellerSlug: text("gcmmo_seller_slug"),
+  gcmmoSellerName: text("gcmmo_seller_name"),
+  // Chất lượng shop — lưu tại thời điểm import, cập nhật mỗi lần sync
+  sellerReviewCount: integer("seller_review_count").default(0),  // tổng lượt đánh giá của shop
+  sellerRating: integer("seller_rating").default(0),             // rating * 10 (vd: 4.8 → 48) để tránh decimal
+  sellerSoldCount: integer("seller_sold_count").default(0),      // tổng đơn hàng shop đã hoàn thành
+  sellerPositiveRate: integer("seller_positive_rate").default(0),// % hài lòng (0–100)
   stock: integer("stock").default(0),  // tồn kho gcmmo (cập nhật khi sync)
   imageUrl: text("image_url"),
   isActive: boolean("is_active").notNull().default(true),

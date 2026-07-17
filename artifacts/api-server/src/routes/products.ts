@@ -154,7 +154,14 @@ router.post("/products/import-gcmmo", async (req, res) => {
       const sellPrice = Math.round(gcmmoPrice * (1 + markup / 100));
       const ext = p as any;
       const gcmmoVariantId: string | null = ext.variants?.[0]?.id ?? null;
-      const gcmmoSellerId: string | null = ext.seller_id ?? null;
+      const gcmmoSellerId: string | null = ext.seller_id ?? ext.seller_slug ?? null;
+      const gcmmoSellerSlug: string | null = ext.seller_slug ?? null;
+      const gcmmoSellerName: string | null = ext.seller_name ?? null;
+      // Chất lượng shop — lưu tại thời điểm import
+      const sellerReviewCount: number = ext.seller_review_count ?? 0;
+      const sellerRating: number = ext.seller_rating != null ? Math.round(ext.seller_rating * 10) : 0;
+      const sellerSoldCount: number = ext.seller_sold_count ?? p.sold_count ?? 0;
+      const sellerPositiveRate: number = ext.seller_positive_rate ?? 0;
 
       const existing = await db.query.productsTable.findFirst({
         where: eq(productsTable.sourceId, p.id),
@@ -170,6 +177,12 @@ router.post("/products/import-gcmmo", async (req, res) => {
           stock: p.stock,
           gcmmoVariantId,
           gcmmoSellerId,
+          gcmmoSellerSlug,
+          gcmmoSellerName,
+          sellerReviewCount,
+          sellerRating,
+          sellerSoldCount,
+          sellerPositiveRate,
           updatedAt: new Date(),
         }).where(eq(productsTable.id, existing.id));
         updated++;
@@ -182,6 +195,12 @@ router.post("/products/import-gcmmo", async (req, res) => {
           sourceId: p.id,
           gcmmoVariantId,
           gcmmoSellerId,
+          gcmmoSellerSlug,
+          gcmmoSellerName,
+          sellerReviewCount,
+          sellerRating,
+          sellerSoldCount,
+          sellerPositiveRate,
           imageUrl: p.image_url ?? null,
           description: p.description || null,
           isActive: true,
