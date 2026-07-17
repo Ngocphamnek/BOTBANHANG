@@ -3,20 +3,32 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: MMO Shop API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: products
+    description: Product management
+  - name: inventory
+    description: Inventory management
+  - name: orders
+    description: Order management
+  - name: stats
+    description: Dashboard statistics
+  - name: sync
+    description: Sync from gcmmo.net
+  - name: botUsers
+    description: Telegram bot users
+
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +36,298 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /products:
+    get:
+      operationId: listProducts
+      tags: [products]
+      summary: List all products
+      responses:
+        "200":
+          description: List of products
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Product"
+    post:
+      operationId: createProduct
+      tags: [products]
+      summary: Create a product
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductInput"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+
+  /products/{id}:
+    get:
+      operationId: getProduct
+      tags: [products]
+      summary: Get a product by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Product
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "404":
+          description: Not found
+    patch:
+      operationId: updateProduct
+      tags: [products]
+      summary: Update a product
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductUpdate"
+      responses:
+        "200":
+          description: Updated product
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+    delete:
+      operationId: deleteProduct
+      tags: [products]
+      summary: Delete a product
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /products/{id}/inventory:
+    get:
+      operationId: getProductInventory
+      tags: [inventory]
+      summary: Get inventory items for a product
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Inventory items
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InventoryItem"
+    post:
+      operationId: addInventoryItems
+      tags: [inventory]
+      summary: Add inventory items (accounts/keys) to a product
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InventoryInput"
+      responses:
+        "201":
+          description: Items added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  added:
+                    type: integer
+                required: [added]
+
+  /inventory/{id}:
+    delete:
+      operationId: deleteInventoryItem
+      tags: [inventory]
+      summary: Delete an inventory item
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+
+  /orders:
+    get:
+      operationId: listOrders
+      tags: [orders]
+      summary: List all orders
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Order"
+
+  /orders/recent:
+    get:
+      operationId: listRecentOrders
+      tags: [orders]
+      summary: Most recent 10 orders
+      responses:
+        "200":
+          description: Recent orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Order"
+
+  /orders/{id}:
+    get:
+      operationId: getOrder
+      tags: [orders]
+      summary: Get an order by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          description: Not found
+    patch:
+      operationId: updateOrder
+      tags: [orders]
+      summary: Update an order status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrderUpdate"
+      responses:
+        "200":
+          description: Updated order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Dashboard statistics
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+
+  /revenue-chart:
+    get:
+      operationId: getRevenueChart
+      tags: [stats]
+      summary: Revenue by day for last 30 days
+      responses:
+        "200":
+          description: Revenue data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RevenuePoint"
+
+  /sync:
+    post:
+      operationId: triggerSync
+      tags: [sync]
+      summary: Trigger full sync from gcmmo.net
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResult"
+
+  /bot-users:
+    get:
+      operationId: listBotUsers
+      tags: [botUsers]
+      summary: List Telegram bot users
+      responses:
+        "200":
+          description: Bot users
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BotUser"
+
 components:
   schemas:
     HealthStatus:
@@ -31,6 +335,187 @@ components:
       properties:
         status:
           type: string
-      required:
-        - status
+      required: [status]
 
+    Product:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: ["string", "null"]
+        price:
+          type: integer
+        category:
+          type: ["string", "null"]
+        sourceId:
+          type: ["string", "null"]
+        imageUrl:
+          type: ["string", "null"]
+        isActive:
+          type: boolean
+        inventoryCount:
+          type: integer
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required: [id, name, price, isActive, inventoryCount, createdAt, updatedAt]
+
+    ProductInput:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        price:
+          type: integer
+        category:
+          type: string
+        sourceId:
+          type: string
+        imageUrl:
+          type: string
+        isActive:
+          type: boolean
+      required: [name, price]
+
+    ProductUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        price:
+          type: integer
+        category:
+          type: string
+        imageUrl:
+          type: string
+        isActive:
+          type: boolean
+
+    InventoryItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        productId:
+          type: integer
+        content:
+          type: string
+        status:
+          type: string
+          enum: [available, sold, reserved]
+        createdAt:
+          type: string
+        soldAt:
+          type: ["string", "null"]
+      required: [id, productId, content, status, createdAt]
+
+    InventoryInput:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: string
+          description: List of account strings / keys to add
+      required: [items]
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: integer
+        telegramUserId:
+          type: integer
+        telegramUsername:
+          type: ["string", "null"]
+        productId:
+          type: integer
+        productName:
+          type: ["string", "null"]
+        quantity:
+          type: integer
+        totalPrice:
+          type: integer
+        status:
+          type: string
+          enum: [pending_payment, paid, delivered, cancelled]
+        paymentMethod:
+          type: ["string", "null"]
+        deliveredItems:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+      required: [id, telegramUserId, quantity, totalPrice, status, createdAt, updatedAt]
+
+    OrderUpdate:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [pending_payment, paid, delivered, cancelled]
+        paymentMethod:
+          type: string
+
+    Stats:
+      type: object
+      properties:
+        totalRevenue:
+          type: integer
+        pendingOrders:
+          type: integer
+        totalProducts:
+          type: integer
+        totalInventory:
+          type: integer
+        totalUsers:
+          type: integer
+        todayOrders:
+          type: integer
+      required: [totalRevenue, pendingOrders, totalProducts, totalInventory, totalUsers, todayOrders]
+
+    SyncResult:
+      type: object
+      properties:
+        synced:
+          type: integer
+        message:
+          type: string
+      required: [synced, message]
+
+    BotUser:
+      type: object
+      properties:
+        id:
+          type: integer
+        telegramId:
+          type: integer
+        username:
+          type: ["string", "null"]
+        firstName:
+          type: ["string", "null"]
+        lastName:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+      required: [id, telegramId, createdAt]
+
+    RevenuePoint:
+      type: object
+      properties:
+        date:
+          type: string
+        revenue:
+          type: integer
+        orders:
+          type: integer
+      required: [date, revenue, orders]
